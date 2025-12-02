@@ -1,7 +1,9 @@
 import logging
 from http import HTTPStatus
 from typing import List, Optional
+from urllib.parse import urlparse, urlunparse, unquote
 
+import httpx
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Path as PathParam, Query, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 
@@ -98,6 +100,50 @@ async def process_files(
     )
 
 
+@file_management_config_router.get("/download/{object_name:path}")
+async def get_storage_file(
+    object_name: str = PathParam(..., description="File object name"),
+    download: str = Query("ignore", description="How to get the file"),
+    expires: int = Query(3600, description="URL validity period (seconds)")
+):
+    """
+    Get information, download link, or file stream for a single file
+
+    - **object_name**: File object name
+    - **download**: Download mode: ignore (default, return file info), stream (return file stream), redirect (redirect to download URL)
+    - **expires**: URL validity period in seconds (default 3600)
+
+    Returns file information, download link, or file content
+    """
+    try:
+        logger.info(f"[get_storage_file] Route matched! object_name={object_name}, download={download}")
+        if download == "redirect":
+            # return a redirect download URL
+            result = await get_file_url_impl(object_name=object_name, expires=expires)
+            return RedirectResponse(url=result["url"])
+        elif download == "stream":
+            # return a readable file stream
+            file_stream, content_type = await get_file_stream_impl(object_name=object_name)
+            logger.info(f"Streaming file: object_name={object_name}, content_type={content_type}")
+            return StreamingResponse(
+                file_stream,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{object_name}"'
+                }
+            )
+        else:
+            # return file metadata
+            return await get_file_url_impl(object_name=object_name, expires=expires)
+    except Exception as e:
+        logger.error(f"Failed to get file: object_name={object_name}, error={str(e)}")
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get file information: {str(e)}"
+        )
+
+
+
 @file_management_runtime_router.post("/storage")
 async def storage_upload_files(
     files: List[UploadFile] = File(..., description="List of files to upload"),
@@ -158,43 +204,174 @@ async def get_storage_files(
         )
 
 
-@file_management_config_router.get("/storage/{path}/{object_name}")
-async def get_storage_file(
-    object_name: str = PathParam(..., description="File object name"),
-    download: str = Query("ignore", description="How to get the file"),
-    expires: int = Query(3600, description="URL validity period (seconds)")
+def _normalize_datamate_download_url(raw_url: str) -> str:
+    """
+    Normalize Datamate download URL to ensure it follows /data-management/datasets/{datasetId}/files/{fileId}/download
+    """
+    parsed_url = urlparse(raw_url)
+    path_segments = [segment for segment in parsed_url.path.split("/") if segment]
+
+    if "data-management" not in path_segments:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Invalid Datamate URL: missing 'data-management' segment"
+        )
+
+    try:
+        dm_index = path_segments.index("data-management")
+        datasets_index = path_segments.index("datasets", dm_index)
+        dataset_id = path_segments[datasets_index + 1]
+        files_index = path_segments.index("files", datasets_index)
+        file_id = path_segments[files_index + 1]
+    except (ValueError, IndexError):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Invalid Datamate URL: unable to parse dataset_id or file_id"
+        )
+
+    prefix_segments = path_segments[:dm_index]
+    prefix_path = "/" + "/".join(prefix_segments) if prefix_segments else ""
+    normalized_path = f"{prefix_path}/data-management/datasets/{dataset_id}/files/{file_id}/download"
+
+    normalized_url = urlunparse((
+        parsed_url.scheme,
+        parsed_url.netloc,
+        normalized_path,
+        "",
+        "",
+        ""
+    ))
+
+    return normalized_url
+
+
+def _build_datamate_url_from_parts(base_url: str, dataset_id: str, file_id: str) -> str:
+    """
+    Build Datamate download URL from individual parts
+    """
+    if not base_url:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="base_url is required when dataset_id and file_id are provided"
+        )
+
+    parsed_base = urlparse(base_url)
+    base_prefix = parsed_base.path.rstrip("/")
+
+    if base_prefix and not base_prefix.endswith("/api"):
+        if base_prefix.endswith("/"):
+            base_prefix = f"{base_prefix}api"
+        else:
+            base_prefix = f"{base_prefix}/api"
+    elif not base_prefix:
+        base_prefix = "/api"
+
+    normalized_path = f"{base_prefix}/data-management/datasets/{dataset_id}/files/{file_id}/download"
+
+    return urlunparse((
+        parsed_base.scheme,
+        parsed_base.netloc,
+        normalized_path,
+        "",
+        "",
+        ""
+    ))
+
+
+@file_management_config_router.get("/datamate/download")
+async def download_datamate_file(
+    url: Optional[str] = Query(None, description="Datamate file URL to download"),
+    base_url: Optional[str] = Query(None, description="Datamate base server URL (e.g., http://host:port or http://host:port/api)"),
+    dataset_id: Optional[str] = Query(None, description="Datamate dataset ID"),
+    file_id: Optional[str] = Query(None, description="Datamate file ID"),
+    filename: Optional[str] = Query(None, description="Optional filename for download"),
+    authorization: Optional[str] = Header(None, alias="Authorization")
 ):
     """
-    Get information, download link, or file stream for a single file
+    Download file from Datamate knowledge base via HTTP URL
 
-    - **object_name**: File object name
-    - **download**: Download mode: ignore (default, return file info), stream (return file stream), redirect (redirect to download URL)
-    - **expires**: URL validity period in seconds (default 3600)
+    - **url**: Full HTTP URL of the file to download (optional)
+    - **base_url**: Base server URL (e.g., http://host:port or http://host:port/api)
+    - **dataset_id**: Datamate dataset ID
+    - **file_id**: Datamate file ID
+    - **filename**: Optional filename for the download (extracted automatically if not provided)
+    - **authorization**: Optional authorization header to pass to the target URL
 
-    Returns file information, download link, or file content
+    Returns file stream for download
     """
     try:
-        if download == "redirect":
-            # return a redirect download URL
-            result = await get_file_url_impl(object_name=object_name, expires=expires)
-            return RedirectResponse(url=result["url"])
-        elif download == "stream":
-            # return a readable file stream
-            file_stream, content_type = await get_file_stream_impl(object_name=object_name)
+        if url:
+            logger.info(f"[download_datamate_file] Using full URL: {url}")
+            normalized_url = _normalize_datamate_download_url(url)
+        elif base_url and dataset_id and file_id:
+            logger.info(f"[download_datamate_file] Building URL from parts: base_url={base_url}, dataset_id={dataset_id}, file_id={file_id}")
+            normalized_url = _build_datamate_url_from_parts(base_url, dataset_id, file_id)
+        else:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="Either url or (base_url, dataset_id, file_id) must be provided"
+            )
+
+        logger.info(f"[download_datamate_file] Normalized download URL: {normalized_url}")
+        logger.info(f"[download_datamate_file] Authorization header present: {authorization is not None}")
+
+        headers = {}
+        if authorization:
+            headers["Authorization"] = authorization
+            logger.debug(f"[download_datamate_file] Using authorization header: {authorization[:20]}...")
+        headers["User-Agent"] = "Nexent-File-Downloader/1.0"
+
+        logger.info(f"[download_datamate_file] Request headers: {list(headers.keys())}")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(normalized_url, headers=headers, follow_redirects=True)
+            logger.info(f"[download_datamate_file] Response status: {response.status_code}")
+
+            if response.status_code == 404:
+                logger.error(f"[download_datamate_file] File not found at URL: {normalized_url}")
+                logger.error(f"[download_datamate_file] Response headers: {dict(response.headers)}")
+                raise HTTPException(
+                    status_code=HTTPStatus.NOT_FOUND,
+                    detail="File not found. Please verify dataset_id and file_id."
+                )
+
+            response.raise_for_status()
+
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+
+            download_filename = filename
+            if not download_filename:
+                content_disposition = response.headers.get("Content-Disposition", "")
+                if content_disposition:
+                    import re
+                    filename_match = re.search(r'filename="?(.+?)"?$', content_disposition)
+                    if filename_match:
+                        download_filename = filename_match.group(1)
+
+                if not download_filename:
+                    path = unquote(urlparse(normalized_url).path)
+                    download_filename = path.split('/')[-1] or "download"
+
             return StreamingResponse(
-                file_stream,
+                iter([response.content]),
                 media_type=content_type,
                 headers={
-                    "Content-Disposition": f'inline; filename="{object_name}"'
+                    "Content-Disposition": f'attachment; filename="{download_filename}"'
                 }
             )
-        else:
-            # return file metadata
-            return await get_file_url_impl(object_name=object_name, expires=expires)
+    except httpx.HTTPError as e:
+        logger.error(f"Failed to download file from URL {url}: {str(e)}")
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_GATEWAY,
+            detail=f"Failed to download file from URL: {str(e)}"
+        )
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Failed to download datamate file: {str(e)}")
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get file information: {str(e)}"
+            detail=f"Failed to download file: {str(e)}"
         )
 
 

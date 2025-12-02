@@ -5,6 +5,87 @@ import { fetchWithAuth } from '@/lib/auth';
 // @ts-ignore
 const fetch = fetchWithAuth;
 
+/**
+ * Extract object_name from image URL
+ * Supports formats like:
+ * - http://localhost:3000/nexent/attachments/filename.png
+ * - /nexent/attachments/filename.png
+ * - attachments/filename.png
+ * @param url Image URL
+ * @returns object_name or null
+ */
+export function extractObjectNameFromImageUrl(url: string): string | null {
+  try {
+    // Handle object_name or relative paths directly (e.g. "attachments/xxx.pdf")
+    const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
+    if (!isHttpUrl) {
+      // Remove leading "/" if present
+      const normalized = url.replace(/^\/+/, "");
+      if (!normalized) {
+        return null;
+      }
+
+      const attachmentsIndex = normalized.indexOf("attachments/");
+      if (attachmentsIndex >= 0) {
+        return normalized.slice(attachmentsIndex);
+      }
+
+      // If there is no "attachments" segment but this is a plain path,
+      // treat the whole normalized path as object_name
+      return normalized;
+    }
+
+    // Handle relative URLs
+    if (url.startsWith("/")) {
+      // Remove leading slash and extract path after /nexent/ or /attachments/
+      const parts = url.split("/").filter(Boolean);
+      const attachmentsIndex = parts.indexOf("attachments");
+      if (attachmentsIndex >= 0) {
+        return parts.slice(attachmentsIndex).join("/");
+      }
+      // If no attachments found, try to find the last part
+      if (parts.length > 0) {
+        return parts.join("/");
+      }
+    }
+
+    // Handle full URLs
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname;
+    const parts = pathname.split("/").filter(Boolean);
+
+    // Find attachments in path
+    const attachmentsIndex = parts.indexOf("attachments");
+    if (attachmentsIndex >= 0) {
+      return parts.slice(attachmentsIndex).join("/");
+    }
+
+    // If no attachments found, return the last meaningful part
+    if (parts.length > 0) {
+      return parts.join("/");
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * Convert image URL to backend API URL
+ * @param url Original image URL (can be MinIO URL or local path)
+ * @returns Backend API URL for the image
+ */
+export function convertImageUrlToApiUrl(url: string): string {
+  const objectName = extractObjectNameFromImageUrl(url);
+  if (objectName) {
+    // Use the same download endpoint with stream mode for images
+    return API_ENDPOINTS.storage.file(objectName, "stream");
+  }
+  // Fallback to original URL if extraction fails
+  return url;
+}
+
 export const storageService = {
   /**
    * Upload files to storage service
@@ -54,5 +135,108 @@ export const storageService = {
     
     const data = await response.json();
     return data.url;
+  },
+  
+  /**
+   * Download file directly using backend API (faster, browser handles download)
+   * @param objectName File object name
+   * @param filename Optional filename for download
+   * @returns Promise that resolves when download link is opened
+   */
+  async downloadFile(objectName: string, filename?: string): Promise<void> {
+    try {
+      // Use direct link download for better performance
+      // Browser will handle the download stream directly
+      const downloadUrl = API_ENDPOINTS.storage.file(objectName, "stream");
+      
+      // Create download link and trigger download
+      // Using direct link allows browser to handle download stream efficiently
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = filename || objectName.split("/").pop() || "download";
+      link.style.display = "none";
+      document.body.appendChild(link);
+      
+      // Trigger download
+      link.click();
+      
+      // Clean up after a short delay to ensure download starts
+      setTimeout(() => {
+        document.body.removeChild(link);
+      }, 100);
+    } catch (error) {
+      throw new Error(`Failed to download file: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  },
+  
+  /**
+   * Download file from Datamate knowledge base via HTTP URL
+   * @param url HTTP URL of the file to download
+   * @param filename Optional filename for download
+   * @returns Promise that resolves when download link is opened
+   */
+  async downloadDatamateFile(options: {
+    url?: string;
+    baseUrl?: string;
+    datasetId?: string;
+    fileId?: string;
+    filename?: string;
+  }): Promise<void> {
+    try {
+      // Use backend API to download file from HTTP URL
+      // Use fetchWithAuth to pass authorization header
+      const downloadUrl = API_ENDPOINTS.storage.datamateDownload(options);
+      const response = await fetch(downloadUrl);
+      
+      if (!response.ok) {
+        throw new Error(`Failed to download file: ${response.statusText}`);
+      }
+      
+      // Get the blob from response
+      const blob = await response.blob();
+      
+      // Get filename from Content-Disposition header or use provided filename
+      let downloadFilename = options.filename;
+      if (!downloadFilename) {
+        const contentDisposition = response.headers.get("Content-Disposition");
+        if (contentDisposition) {
+          const filenameMatch = contentDisposition.match(/filename="?(.+?)"?$/);
+          if (filenameMatch) {
+            downloadFilename = filenameMatch[1];
+          }
+        }
+      }
+      
+      // If still no filename, extract from URL
+      if (!downloadFilename) {
+        try {
+          const urlString = options.url || downloadUrl;
+          const urlObj = new URL(urlString);
+          const path = urlObj.pathname;
+          downloadFilename = path.split('/').pop() || "download";
+        } catch {
+          downloadFilename = "download";
+        }
+      }
+      
+      // Create download link and trigger download
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = downloadFilename;
+      link.style.display = "none";
+      document.body.appendChild(link);
+      
+      // Trigger download
+      link.click();
+      
+      // Clean up
+      setTimeout(() => {
+        document.body.removeChild(link);
+        window.URL.revokeObjectURL(blobUrl);
+      }, 100);
+    } catch (error) {
+      throw new Error(`Failed to download datamate file: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }; 

@@ -62,7 +62,22 @@ export const API_ENDPOINTS = {
     upload: `${API_BASE_URL}/file/storage`,
     files: `${API_BASE_URL}/file/storage`,
     file: (objectName: string, download: string = "ignore") =>
-      `${API_BASE_URL}/file/storage/${objectName}?download=${download}`,
+      `${API_BASE_URL}/file/download/${objectName}?download=${download}`,
+    datamateDownload: (params: {
+      url?: string;
+      baseUrl?: string;
+      datasetId?: string;
+      fileId?: string;
+      filename?: string;
+    }) => {
+      const queryParams = new URLSearchParams();
+      if (params.url) queryParams.append("url", params.url);
+      if (params.baseUrl) queryParams.append("base_url", params.baseUrl);
+      if (params.datasetId) queryParams.append("dataset_id", params.datasetId);
+      if (params.fileId) queryParams.append("file_id", params.fileId);
+      if (params.filename) queryParams.append("filename", params.filename);
+      return `${API_BASE_URL}/file/datamate/download?${queryParams.toString()}`;
+    },
     delete: (objectName: string) =>
       `${API_BASE_URL}/file/storage/${objectName}`,
     preprocess: `${API_BASE_URL}/file/preprocess`,
